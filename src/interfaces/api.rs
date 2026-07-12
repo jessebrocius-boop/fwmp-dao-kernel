@@ -1,80 +1,56 @@
-// src/interfaces/api.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // oneshot
+    use serde_json::json;
+    use hyper;
 
-use axum::{
-    extract::Json,
-    http::StatusCode,
-    routing::post,
-    Router,
-};
-use serde::{Deserialize, Serialize};
-use chrono::Utc;
+    #[tokio::test]
+    async fn accepted_flow() {
+        let app = router();
+        let payload = json!({
+            "directive": "do_something",
+            "origin_node": "TESTNODE",
+            "data": { "k": "v" }
+        });
 
-/// The expected structure of the incoming request body (n8n "directive" style)
-#[derive(Debug, Deserialize)]
-pub struct IngressBody {
-    #[serde(rename = "directive")]
-    pub action: Option<String>,
-    #[serde(rename = "origin_node")]
-    pub origin_node: Option<String>,
-    pub idempotency_key: Option<String>, // fallback if header is missing
-    pub data: Option<serde_json::Value>,
-}
+        let req = Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .header("content-type", "application/json")
+            .header("x-idempotency-key", "abc123")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
 
-/// The response payload structure returned to the caller
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "UPPERCASE")]
-pub enum IngressResponse {
-    Accepted { data: SanitizedPayload },
-    Rejected { reason: String },
-}
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
 
-#[derive(Debug, Serialize)]
-pub struct SanitizedPayload {
-    pub timestamp: String,
-    pub idempotency_key: String,
-    pub source: String,
-    pub action: String,
-    pub parameters: serde_json::Value,
-}
-
-/// POST /submit
-/// Enforces structural contracts on the payload and headers.
-pub async fn submit_handler(
-    headers: axum::http::HeaderMap,
-    Json(body): Json<IngressBody>,
-) -> (StatusCode, Json<IngressResponse>) {
-    // Extract idempotency key from header, fallback to body.idempotency_key
-    let idempotency_key = headers
-        .get("x-idempotency-key")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .or(body.idempotency_key.clone());
-
-    // Extract action from directive field, fallback to top-level "action"
-    let action = body.action.clone();
-
-    if idempotency_key.is_none() || action.is_none() {
-        let response = IngressResponse::Rejected {
-            reason: "ERR_MALFORMED_PACKET: Guillotine discard reflex engaged. Missing critical routing headers or directive.".to_string(),
-        };
-        return (StatusCode::BAD_REQUEST, Json(response));
+        let body_bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["status"], "ACCEPTED");
     }
 
-    let sanitized = SanitizedPayload {
-        timestamp: headers
-            .get("x-timestamp")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| Utc::now().to_rfc3339()),
-        idempotency_key: idempotency_key.unwrap(),
-        source: body.origin_node.clone().unwrap_or_else(|| "UNKNOWN_NODE".to_string()),
-        action: action.unwrap(),
-        parameters: body.data.clone().unwrap_or(serde_json::json!({})),
-    };
+    #[tokio::test]
+    async fn rejected_flow_missing_idempotency() {
+        let app = router();
+        let payload = json!({
+            "directive": "do_something"
+        });
 
-    (StatusCode::OK, Json(IngressResponse::Accepted { data: sanitized }))
-}
+        let req = Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
 
-pub fn router() -> Router {
-    Router::new().route("/submit", post(submit_handler))
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+
+        let body_bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["status"], "REJECTED");
+    }
 }
